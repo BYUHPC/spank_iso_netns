@@ -1,0 +1,261 @@
+#!/bin/bash -ex
+
+# This script runs as root to set up the namespace created by the SPANK plugin.
+#
+# Author: Ryan Cox
+# 
+# Copyright (C) 2025, Brigham Young University
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see
+# <https://www.gnu.org/licenses/>.
+
+
+#PATH is not set by the SPANK plugin
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+NFT_TABLE_FOR_NETNS=iso_netns
+HTTPPROXY_PATH=/apps/slurm-spank/spank_iso_netns/http_proxy_fd.js
+NODE_PATH=node
+SOCAT_PATH=/apps/slurm-spank/spank_iso_netns/socat/latest/bin/socat
+
+# The devices should be uniquely named in case there is a race with another device being created at the same time
+# from a different job. Is that race possible? I don't know, but it's easy enough to plan for. The devices are only
+# created if needed.
+veth_outer_dev=iso_outer_$SLURM_JOB_ID
+veth_inner_dev=iso_inner_$SLURM_JOB_ID
+veth_outer_ip=169.254.7.1
+veth_inner_ip=169.254.7.2
+veth_netcidr=30
+create_veth=false
+
+# Examples
+ALLOW_OUTBOUND_FROM_NS="tcp . 1.2.3.4 . 443,
+			tcp . 5.6.7.8 . 443,
+			tcp . 9.8.7.6 . 9988"
+
+
+exec >/dev/null 2>&1
+
+# contains_string "$haystack" "$needle"
+contains_string() {
+	local list="$1" # haystack
+	local search_string="$2" #needle
+	
+	# Convert the comma-separated list into an array
+	IFS=',' read -ra array <<< "$list"
+	
+	# Loop through the array to check for the search string
+	for item in "${array[@]}"; do
+		if [[ "$item" == "$search_string" ]]; then
+			return 0  # Found the string
+		fi
+	done
+	
+	return 1  # Did not find the string
+}
+
+setup_veth() {
+	echo Will create veth interface
+	set -x
+	create_veth=true
+
+	ip link add $veth_outer_dev type veth peer name $veth_inner_dev
+	ip addr add $veth_inner_ip/$veth_netcidr dev $veth_inner_dev scope global
+	ip link set $veth_inner_dev up
+	ip link set $veth_outer_dev netns "$SLURMSTEPD_PID"
+	nsenter -n -t "$SLURMSTEPD_PID" \
+		bash -cf "ip addr add $veth_outer_ip/$veth_netcidr dev $veth_outer_dev scope link;
+			ip link set $veth_outer_dev up"
+
+	read -r -a routeget <<<"$(nsenter -n -t "$SLURMSTEPD_PID" ip route get 1.1.1.1 |head -1)"
+	default_out_interface=${routeget[4]}
+	default_out_ip=${routeget[6]}
+
+	# Outer namespace NAT configuration
+	if ! nsenter -n -t "$SLURMSTEPD_PID" nft list chain ip $NFT_TABLE_FOR_NETNS postrouting >/dev/null 2>&1
+	then
+		nsenter -n -t "$SLURMSTEPD_PID" nft -f - <<EOF
+add table ip $NFT_TABLE_FOR_NETNS
+add chain ip $NFT_TABLE_FOR_NETNS postrouting { type nat hook postrouting priority 100 ; }
+add rule ip $NFT_TABLE_FOR_NETNS postrouting ip saddr $veth_inner_ip oifname != "iso_outer_*" counter snat to $default_out_ip
+EOF
+	fi
+
+	# Inner namespace firewall
+	nft -f - <<EOF
+flush ruleset
+
+table ip filter {
+	# Define the set of allowed outbound destinations
+	set allowed_outbound {
+		type inet_proto . ipv4_addr . inet_service
+		elements = {
+			$ALLOW_OUTBOUND_FROM_NS
+		}
+	}
+
+	chain input {
+		type filter hook input priority 0; policy drop;
+		
+		iif lo accept
+		ct state {established, related} accept
+	}
+
+	chain output {
+		type filter hook output priority 0; policy drop;
+		
+		oif lo accept
+		ct state {established, related} accept
+		
+		# Match against the set for outbound connections
+		meta l4proto . ip daddr . th dport @allowed_outbound accept
+	}
+
+	chain forward {
+		type filter hook forward priority 0; policy drop;
+	}
+}
+EOF
+
+	ip route add default via $veth_outer_ip
+	nsenter -n -t "$SLURMSTEPD_PID" sysctl -w net.ipv4.ip_forward=1
+
+}
+
+pre_ns_creation() {
+	echo "debug: pre_ns_creation start"
+	return 0
+}
+
+post_ns_creation_outer() {
+	echo "debug: post_ns_creation_outer start"
+
+	numproxies=$(awk -F, '{print NF}' <<< "$SLURM_SPANK__SLURM_SPANK_OPTION_spank_iso_netns_iso_netns_proxies")
+	for ((i=0; i<$numproxies; i++))
+	do
+		local fd="SPANK_ISO_NETNS_PROXY_FD_$i"
+		local proto="SPANK_ISO_NETNS_PROXY_PROTO_$i"
+		local ip="SPANK_ISO_NETNS_PROXY_IP_$i"
+		local port="SPANK_ISO_NETNS_PROXY_PORT_$i"
+		local extra="SPANK_ISO_NETNS_PROXY_EXTRA_$i"
+
+		(
+			fdnum=${!fd}
+
+			#close everything except stdio and the fd we will use
+			for path in /proc/self/fd/*
+			do
+				i=${path##*/}
+				if ((i > 2 && i != fdnum))
+				then
+					exec {i}>&- 2>/dev/null || true
+				fi
+			done
+
+			if [[ "${!extra}" == "httpproxy" ]]; then
+				"$NODE_PATH" "$HTTPPROXY_PATH" -w <(cat $(sed -e 's/,/ /g' <<< "$SPANK_ISO_NETNS_HTTP_PROXY_CONF")) -f "$fdnum" &
+			elif [[ "${!proto}" == "tcp" ]]; then
+				exec "$SOCAT_PATH" ACCEPT-FD:$fdnum,fork TCP:${!ip}:${!port},retry
+			else
+				echo "UDP is not working yet"
+				continue
+			fi
+		) &
+	done 
+
+	return 0
+}
+
+post_ns_creation() {
+	echo "debug: post_ns_creation start"
+	# Configure loopback interface with IP
+	if ! ip addr add 127.0.0.1/8 dev lo; then
+		echo "Error: Failed to add IP address to loopback interface"
+		exit 2
+	fi
+
+	# Bring up loopback interface
+	if ! ip link set dev lo up; then
+		echo "Error: Failed to bring up loopback interface"
+		exit 3
+	fi
+
+	# Allow binding to any port
+	if ! sysctl -w net.ipv4.ip_unprivileged_port_start=0; then
+		echo "Error: Failed to set unprivileged port start"
+		exit 4
+	fi
+
+	# Listen to all IPs
+	if ! ip route add local 0.0.0.0/0 dev lo; then
+		echo "Error: Could not make namespace respond on all IPv4 IPs"
+		exit 5
+	fi
+
+
+	#FIXME:  If you want to enable the setup of a veth when the option 'veth' is included, uncomment this.
+	#       The code is insufficiently tested at this point for it to be enabled by default.
+	#       Setting up nft automatically is kind of a pain due to some of the rules we have, and we don't
+	#       have an immediate need for it.  If someone wants to test this and contribute code for it, great!
+
+	#if contains_string "$SLURM_SPANK__SLURM_SPANK_OPTION_spank_iso_netns_iso_netns_options" "veth"
+	#then
+	#	setup_veth
+	#fi
+	#END FIXME
+	
+	echo "Post-namespace creation setup completed successfully"
+}
+
+task_exit() {
+	if [[ "$create_veth" == "true" ]]
+	then
+		ip link del $veth_outer_dev
+		ip link del $veth_inner_dev
+	fi
+	exit 0
+}
+
+# Check if an argument was provided
+if [ $# -eq 0 ]; then
+	echo "Error: No stage specified"
+	echo "Usage: $0 <stage>"
+	echo "Stages:"
+	echo "  pre-ns-creation		- Configure network before network namespace creation"
+	echo "  post-ns-creation	- Configure network after network namespace creation"
+	echo "  task-exit		- Cleanup tasks"
+	exit 126
+fi
+
+# Process the command-line argument
+case "$1" in
+	"pre-ns-creation")
+		pre_ns_creation
+		;;
+	"post-ns-creation-outer")
+		post_ns_creation_outer
+		;;
+	"post-ns-creation")
+		post_ns_creation
+		;;
+	"task-exit")
+		task_exit
+		;;
+	*)
+		echo "Error: Unknown stage '$1'"
+		echo "Stages:"
+		echo "  post-ns-creation	- Configure network namespace after creation"
+		exit 127
+		;;
+esac
+exit 0
